@@ -61,7 +61,8 @@ static bool is_block_cached(address_t);
 static struct ca_span *span_get(address_t);
 static int span_search_compare(const void *, const void *);
 static bool verify_sorted_spans(void);
-static bool on_span_object_list(struct ca_span*, address_t);
+static bool span_block_free(struct ca_span*, address_t);
+static bool span_populate_free_bitmap(struct ca_span*);
 
 /******************************************************************************
  * Exposed functions
@@ -161,11 +162,8 @@ get_heap_block_info(address_t addr, struct heap_block* blk)
 	/*
 	 * Block status needs to consult span's object list and all cache lists
 	 */
-	if (span->sizeclass == 0)
-		blk->inuse = true;
-	else if (span->objects != 0 && on_span_object_list(span, blk->addr))
-		blk->inuse = false;
-	else if (is_block_cached(blk->addr) == true)
+	span_populate_free_bitmap(span);
+	if (span_block_free(span, blk->addr) == true)
 		blk->inuse = false;
 	else
 		blk->inuse = true;
@@ -176,13 +174,77 @@ get_heap_block_info(address_t addr, struct heap_block* blk)
 bool
 get_next_heap_block(address_t addr, struct heap_block* blk)
 {
+	struct ca_span *span, *last_span, *next;
+	unsigned long pageid;
 
 	if (g_initialized == false) {
 		CA_PRINT("tcmalloc heap was not initialized successfully\n");
 		return false;
 	}
 
-	CA_PRINT("heap API get_next_heap_block() is yet Implemented\n");
+	if (addr == 0) {
+		if (g_spans_count == 0) {
+			CA_PRINT("There is not heap block\n");
+			return false;
+		}
+		/*
+		* Return the first block with lowest address
+		*/
+		span = &g_spans[0];
+	} else {
+		span = span_get(addr);
+		if (span == NULL) {
+			CA_PRINT("The input address %#lx doesn't belong to "
+			    "the heap\n", addr);
+			return false;
+		}
+
+		if (span->location == IN_USE && span->sizeclass != 0) {
+			size_t blk_sz = g_config.sizemap.class_to_size[span->sizeclass];
+			address_t base = span->start << g_config.kPageShift;
+			unsigned int index = (addr - base) / blk_sz;
+			unsigned n, bit;
+			if (index < span->count -1 ) {
+				index++;
+				blk->addr = base + index * blk_sz;
+				blk->size = blk_sz;
+				n = index / UINT_BITS;
+				bit = index - n * UINT_BITS;
+				blk->inuse = !(span->bitmap[n] & (1 << bit));
+				return true;
+			}
+		}
+
+		/*
+		* The next block is in the next span
+		*/
+		last_span = &g_spans[g_spans_count - 1];
+		next = NULL;
+		for (pageid = span->start + span->length;
+		    pageid <= last_span->start;
+		    pageid++) {
+			next = span_get(pageid << g_config.kPageShift);
+			if (next != NULL)
+				break;
+		}
+		if (next == NULL)
+			return false;
+		span = next;
+	}
+
+	span_populate_free_bitmap(span);
+	blk->addr = span->start << g_config.kPageShift;
+	if (span->location != IN_USE) {
+		blk->size = span->length << g_config.kPageShift;
+		blk->inuse = false;
+	} else if (span->sizeclass == 0) {
+		blk->size = span->length << g_config.kPageShift;
+		blk->inuse = true;
+	} else {
+		blk->size = g_config.sizemap.class_to_size[span->sizeclass];
+		blk->inuse = !(span->bitmap[0] & 1);
+	}
+
 	return true;
 }
 
@@ -232,13 +294,51 @@ get_biggest_blocks(struct heap_block* blks, unsigned int num)
 bool
 walk_inuse_blocks(struct inuse_block* opBlocks, unsigned long* opCount)
 {
+	unsigned long i;
+	struct ca_span *span;
 
 	if (g_initialized == false) {
 		CA_PRINT("tcmalloc heap was not initialized successfully\n");
 		return false;
 	}
 
-	CA_PRINT("heap API walk_inuse_blocks() is yet Implemented\n");
+	*opCount = 0;
+	for (i = 0; i < g_spans_count; i++) {
+		span = &g_spans[i];
+		span_populate_free_bitmap(span);
+
+		if (span->location != IN_USE)
+			continue;
+
+		if (span->sizeclass == 0) {
+			(*opCount)++;
+			if (opBlocks != NULL) {
+				opBlocks->addr = span->start << g_config.kPageShift;
+				opBlocks->size = span->length << g_config.kPageShift;
+				opBlocks++;
+			}
+		} else {
+			address_t base = span->start << g_config.kPageShift;
+			unsigned int index;
+			size_t blk_sz = g_config.sizemap.class_to_size[span->sizeclass];
+
+			for (index = 0; index < span->count; index++) {
+				unsigned int n, bit;
+
+				n = index / UINT_BITS;
+				bit = index - n * UINT_BITS;
+				if (!(span->bitmap[n] & (1 << bit))) {
+					(*opCount)++;
+					if (opBlocks != NULL) {
+						opBlocks->addr = base + index * blk_sz;
+						opBlocks->size = blk_sz;
+						opBlocks++;
+					}
+				}
+			}
+		}
+	}
+
 	return true;
 }
 
@@ -594,9 +694,9 @@ parse_central_freelist(struct value *cfl)
 			count++;
 	}
 	if (count != used_slots) {
-		/* FIXME we should report heap corruption here */
-		CA_PRINT("CentralFreeList records %d slots are used while "
-		    "tc_slots_ shows %d\n", used_slots, count);
+		/* FIXME */
+		CA_PRINT("Heap corruption: CentralFreeList records %d slots "
+		    "are used while tc_slots_ shows %d\n", used_slots, count);
 	}
 
 	return true;
@@ -662,23 +762,111 @@ parse_central_freelist_tcentry(struct value *tcentry, bool *empty_slot)
 }
 
 bool
-on_span_object_list(struct ca_span *span, address_t addr)
+span_populate_free_bitmap(struct ca_span *span)
 {
-	address_t cursor, next;
+	size_t blk_sz, n_uint;
+	address_t base, end, cursor, next;
+	unsigned long i;
+	unsigned int index, n, bit;
 
+	if (span->bitmap != NULL ||
+	    span->sizeclass == 0 ||
+	    span->location != IN_USE) {
+		return true;
+	}
+
+	/*
+	 * Allocate space for the bitmap
+	 */
+	blk_sz = g_config.sizemap.class_to_size[span->sizeclass];
+	span->count = (span->length << g_config.kPageShift) / blk_sz;
+	n_uint = (span->count + UINT_BITS - 1) / UINT_BITS;
+	span->bitmap = calloc(n_uint, sizeof(unsigned int));
+	if (span->bitmap == NULL) {
+		CA_PRINT("%s: out out memory\n", __FUNCTION__);
+		return false;
+	}
+
+	/*
+	 * Walk objects list for free blocks
+	 */
+	base = span->start << g_config.kPageShift;
+	end = base + span->count * blk_sz;
 	cursor = span->objects;
 	while (cursor != 0) {
-		if (cursor == addr)
-			return true;
+		/*
+		 * Address check
+		 */
+		if (cursor < base || cursor >= end) {
+			/* FIXME */
+			CA_PRINT("Heap corruption: objects list node %#lx is "
+			    "out of span's range\n", cursor);
+			break;
+		}
+		index = (cursor - base) / blk_sz;
+		if (base + index * blk_sz != cursor) {
+			/* FIXME */
+			CA_PRINT("Heap corruption: invalid free %#lx\n",
+			    cursor);
+			break;
+		}
 
+		/*
+		 * Set bitmap
+		 */
+		n = index / UINT_BITS;
+		bit = index - n * UINT_BITS;
+		span->bitmap[n] |= 1 << bit;
+
+		/*
+		 * Move to the next link node
+		 */
 		if (read_memory_wrapper(NULL, cursor, &next, sizeof(void*)) ==
 		    false) {
 			break;
 		}
 		cursor = next;
 	}
+	/*
+	 * Cached blocks are free blocks as well
+	 * g_cached_blocks has been sorted by now
+	 */
+	for (i = 0; i < g_cached_blocks_count; i++) {
+		address_t addr = g_cached_blocks[i];
+	
+		if (addr < base)
+			continue;
+		else if (addr >= end)
+			break;
 
-	return false;
+		index = (addr - base) / blk_sz;
+		n = index / UINT_BITS;
+		bit = index - n * UINT_BITS;
+		span->bitmap[n] |= 1 << bit;
+	}
+
+	return true;
+}
+
+bool
+span_block_free(struct ca_span *span, address_t addr)
+{
+	address_t base;
+	unsigned int index, n, bit;
+	size_t blk_sz;
+
+	if (span->location != IN_USE)
+		return true;
+	else if (span->sizeclass == 0)
+		return false;
+
+	base = span->start << g_config.kPageShift;
+	blk_sz = g_config.sizemap.class_to_size[span->sizeclass];
+	index = (addr - base) / blk_sz;
+	n = index / UINT_BITS;
+	bit = index - n * UINT_BITS;
+
+	return span->bitmap[n] & (1 << bit);
 }
 
 int
@@ -757,6 +945,7 @@ parse_span(struct value *span)
 	struct ca_span *my_span;
 	struct value *m;
 	struct type *type = value_type(span);
+	struct ca_segment *segment;
 
 	if (g_spans_count >= g_spans_capacity) {
 		unsigned long goal;
@@ -809,6 +998,11 @@ parse_span(struct value *span)
 	my_span->sample = value_as_long(m);
 
 	skip_npage = my_span->length - 1;
+
+	segment = get_segment(my_span->start << g_config.kPageShift,
+	    my_span->length << g_config.kPageShift);
+	if (segment != NULL)
+		segment->m_type = ENUM_HEAP;
 
 	return true;
 }

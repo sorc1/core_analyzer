@@ -23,6 +23,12 @@ struct ca_span {
 	unsigned int sizeclass : 8;
 	unsigned int location : 2;
 	unsigned int sample : 1;
+	/*
+	 * A bit map with set bit indicating free block
+	 */
+	unsigned int *bitmap;
+	unsigned int count;
+#define UINT_BITS 32
 };
 
 struct ca_config {
